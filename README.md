@@ -10,8 +10,8 @@ As quantum computing advances, traditional encryption standard in today's networ
 
 ## Key Goals
 
-**Quantum-Resistant Defense:** Shielding network traffic against post-quantum attacks.
-**Zero Application Overhead:** Works transparently at the network layer no code changes required for existing client or server apps.
-**Seamless Encapsulation:** Securely wraps and handles client-server data communications.
-**High Performance:** Designed to minimize latency and bandwidth overhead while maintaining top-tier protection.
-**Universal System Compatibility:** Runs seamlessly on any operating system, containerized platform, or hardware architecture without changing underlying application code.
+* **Quantum-Resistant Defense:** Shielding network traffic against post-quantum attacks.
+* **Zero Application Overhead:** Works transparently at the network layer no code changes required for existing client or server apps.
+* **Seamless Encapsulation:** Securely wraps and handles client-server data communications.
+* **High Performance:** Designed to minimize latency and bandwidth overhead while maintaining top-tier protection.
+* **Universal System Compatibility:** Runs seamlessly on any operating system, containerized platform, or hardware architecture without changing underlying application code.
