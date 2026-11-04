@@ -1,3 +1,7 @@
 .venv/
 .venv
+/orca-main/liboqs
+__pycache__/
+/orca-main/__pycache__
+venv/
 
