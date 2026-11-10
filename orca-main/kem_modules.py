@@ -136,7 +136,7 @@ class PQCKEM(BaseKEM):
     """Post-Quantum KEM wrapper around liboqs (supports ML-KEM-512/768/1024)."""
 
     def __init__(self, alg_name: str = "ML-KEM-768"):
-        enabled = oqs.get_enabled_KEM_mechanisms()
+        enabled = oqs.get_enabled_kem_mechanisms()
         # Fallback if older liboqs uses "Kyber768" naming instead of "ML-KEM-768"
         if alg_name not in enabled:
             fallback_map = {
