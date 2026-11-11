@@ -1,2 +1,4 @@
 key_store/
 key_store/
+__pycache__/
+*.pyc
