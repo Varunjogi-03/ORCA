@@ -1,23 +1,26 @@
-import os
-import time
+import glob
+import inspect
+import json
 import math
+import os
 import socket
 import struct
+import subprocess
+import sys
 import threading
-import inspect
+import time
+import numpy as np
+import oqs
+import pandas as pd
+import plotly.express as px
 import psutil
 import streamlit as st
-import pandas as pd
-import numpy as np
-import plotly.express as px
-import plotly.graph_objects as go
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-import oqs
 import kem_modules
+from server import SUITE_REGISTRY, HOST, PORT
 
 st.set_page_config(page_title="ORCA: PQC Migration Benchmark", layout="wide")
 
-# Custom compact styling for metric cards
 st.markdown("""
 <style>
 div[data-testid="stMetricValue"] { font-size: 1.4rem; }
@@ -26,27 +29,33 @@ div[data-testid="stMetricValue"] { font-size: 1.4rem; }
 
 st.title("ORCA: Hybrid Post-Quantum Cryptography Migration Suite")
 
-# -------------------------------------------------------------------------
-# AUTO-DISCOVER KEM CLASSES FROM kem_modules.py
-# -------------------------------------------------------------------------
-KEM_CLASSES = {
-    name: cls
-    for name, cls in inspect.getmembers(kem_modules, inspect.isclass)
-    if cls.__module__ == "kem_modules" and not inspect.isabstract(cls) and name != "BaseKEM"
-}
+# Use the exact 6-suite registry from server.py so all 6 configurations are available everywhere
+SUITE_BY_NAME = {name: (sid, factory) for sid, (name, factory) in SUITE_REGISTRY.items()}
 
+
+def check_server_online(host: str = HOST, port: int = PORT) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
+# Top Environment Status Bar
+srv_online = check_server_online()
 col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("liboqs C Engine", oqs.oqs_version())
-col2.metric("Active KEM Modules", len(KEM_CLASSES))
-col3.metric("Classical Baseline", "X25519 / P-256")
+col2.metric("Configured KEM Suites", len(SUITE_BY_NAME))
+col3.metric("Async TCP Server (9443)", "ONLINE" if srv_online else "OFFLINE")
 col4.metric("NIST PQC Standard", "FIPS 203 (ML-KEM)")
 col5.metric("AEAD Data Cipher", "AES-256-GCM")
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "1. Handshake & AES-GCM Tunnel",
-    "2. Micro-Benchmark & Tail Distributions",
-    "3. MTU Fragmentation & Real TCP Loopback",
-    "4. NIST SP 800-22 & Bit-Noise Matrix"
+    "2. Micro-Benchmark & Distributions",
+    "3. MTU Fragmentation Analyzer",
+    "4. NIST SP 800-22 & Bit-Noise",
+    "5. Live Client-Server & Key Store"
 ])
 
 
@@ -101,11 +110,11 @@ def run_kem_exchange(kem, corrupt_ct: bool = False):
 
 @st.cache_data
 def get_baseline_kem_profiles():
-    """Cached baseline inspection so Tab 3 sliders respond instantaneously."""
+    """Cached baseline inspection across all 6 KEM suites."""
     profiles = []
-    for name, cls in KEM_CLASSES.items():
+    for name, (_, factory) in SUITE_BY_NAME.items():
         try:
-            inst = cls()
+            inst = factory()
             pk, ct, ss_s, _, t_kg, t_enc, t_dec = run_kem_exchange(inst, False)
             profiles.append({
                 "Algorithm": name,
@@ -127,9 +136,9 @@ with tab1:
 
     c_left, c_right = st.columns([2, 1])
     with c_left:
-        selected_class_name = st.radio(
-            "Select KEM Class:",
-            list(KEM_CLASSES.keys()),
+        selected_suite_name = st.radio(
+            "Select KEM Suite:",
+            list(SUITE_BY_NAME.keys()),
             horizontal=True
         )
         test_message = st.text_input(
@@ -141,8 +150,8 @@ with tab1:
         corrupt_ct = st.checkbox("Flip 1 Bit in KEM Ciphertext (Test Implicit Rejection)")
 
     if st.button("Execute Handshake & Transmit Encrypted Payload", type="primary"):
-        kem_cls = KEM_CLASSES[selected_class_name]
-        kem_instance = kem_cls()
+        _, factory = SUITE_BY_NAME[selected_suite_name]
+        kem_instance = factory()
 
         try:
             pk, ct, ss_server, ss_client, t_keygen, t_encap, t_decap = run_kem_exchange(
@@ -164,7 +173,6 @@ with tab1:
                     f"Server: `{ss_server.hex()[:28]}...`\n\nClient: `{ss_client.hex()[:28]}...`"
                 )
 
-            # End-to-End AES-256-GCM Tunnel Test
             st.markdown("#### Step 4: Symmetric AEAD Tunnel Verification (`AES-256-GCM`)")
             nonce = os.urandom(12)
             server_aead = AESGCM(ss_server[:32])
@@ -196,12 +204,12 @@ with tab2:
     col_cfg1, col_cfg2 = st.columns([2, 1])
     with col_cfg1:
         selected_bench_kems = st.multiselect(
-            "Select KEM Modules:",
-            list(KEM_CLASSES.keys()),
-            default=list(KEM_CLASSES.keys())
+            "Select KEM Suites:",
+            list(SUITE_BY_NAME.keys()),
+            default=list(SUITE_BY_NAME.keys())
         )
     with col_cfg2:
-        iterations = st.slider("Iterations per Module:", min_value=50, max_value=2000, value=300, step=50)
+        iterations = st.slider("Iterations per Suite:", min_value=50, max_value=2000, value=250, step=50)
 
     if st.button("Run Full Benchmark & Distribution Analysis", type="primary"):
         process = psutil.Process(os.getpid())
@@ -210,11 +218,10 @@ with tab2:
         raw_samples = []
 
         for idx, name in enumerate(selected_bench_kems):
-            cls = KEM_CLASSES[name]
-            instance = cls()
+            _, factory = SUITE_BY_NAME[name]
+            instance = factory()
             run_kem_exchange(instance, False)  # Warm-up
 
-            rss_before = process.memory_info().rss / (1024 * 1024)
             t_kg_list, t_enc_list, t_dec_list = [], [], []
             pk_len, ct_len, ss_len = 0, 0, 0
 
@@ -287,70 +294,10 @@ with tab2:
 
 
 # =========================================================================
-# TAB 3: MTU FRAGMENTATION & REAL LOOPBACK TCP BENCHMARK
+# TAB 3: MTU FRAGMENTATION ANALYZER
 # =========================================================================
-def run_real_tcp_handshake(kem_cls, mss_limit: int, trials: int = 30) -> float:
-    """Runs an actual TCP socket loopback handshake over 127.0.0.1 with TCP_MAXSEG."""
-    kem_server = kem_cls()
-    kem_client = kem_cls()
-    timings = []
-
-    for _ in range(trials):
-        srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            srv_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG, mss_limit)
-        except OSError:
-            pass
-        srv_sock.bind(("127.0.0.1", 0))
-        port = srv_sock.getsockname()[1]
-        srv_sock.listen(1)
-
-        def server_worker():
-            conn, _ = srv_sock.accept()
-            # Read 4-byte length header + ClientHello PK
-            raw_len = conn.recv(4)
-            pk_len = struct.unpack("!I", raw_len)[0]
-            pk_buf = b""
-            while len(pk_buf) < pk_len:
-                pk_buf += conn.recv(pk_len - len(pk_buf))
-
-            # Encapsulate and send back ServerHello CT
-            encap_fn = getattr(kem_server, "encapsulate", None) or getattr(kem_server, "encap_secret", None)
-            ct, _ = encap_fn(pk_buf)
-            conn.sendall(struct.pack("!I", len(ct)) + ct)
-            conn.close()
-
-        t_srv = threading.Thread(target=server_worker, daemon=True)
-        t_srv.start()
-
-        t0 = time.perf_counter_ns()
-        cli_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            cli_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG, mss_limit)
-        except OSError:
-            pass
-        cli_sock.connect(("127.0.0.1", port))
-
-        pk, _, _, _, _, _, _ = run_kem_exchange(kem_client, False)
-        cli_sock.sendall(struct.pack("!I", len(pk)) + pk)
-
-        raw_ct_len = cli_sock.recv(4)
-        ct_len = struct.unpack("!I", raw_ct_len)[0]
-        ct_buf = b""
-        while len(ct_buf) < ct_len:
-            ct_buf += cli_sock.recv(ct_len - len(ct_buf))
-
-        cli_sock.close()
-        t_srv.join()
-        srv_sock.close()
-        timings.append((time.perf_counter_ns() - t0) / 1e6)
-
-    return float(np.median(timings))
-
-
 with tab3:
-    st.subheader("TLS 1.3 MTU Fragmentation Visualizer & Live TCP Socket Testbed")
+    st.subheader("TLS 1.3 MTU Fragmentation Visualizer & Tail-Latency Simulator")
 
     s1, s2, s3, s4 = st.columns(4)
     with s1:
@@ -430,19 +377,6 @@ with tab3:
         )
         st.plotly_chart(fig_lat, use_container_width=True)
 
-    st.divider()
-    st.markdown("#### Phase 2 Preview: Real Kernel Socket Loopback Test (`127.0.0.1` with `TCP_MAXSEG`)")
-    if st.button("Execute Real TCP Socket Handshakes (30 Trials per Algorithm)"):
-        sock_rows = []
-        for name, cls in KEM_CLASSES.items():
-            med_ms = run_real_tcp_handshake(cls, mss_limit=mss, trials=30)
-            sock_rows.append({
-                "Algorithm": name,
-                "Configured TCP_MAXSEG (B)": mss,
-                "Median Real Socket Handshake (ms)": round(med_ms, 3)
-            })
-        st.dataframe(pd.DataFrame(sock_rows), use_container_width=True)
-
 
 # =========================================================================
 # TAB 4: NIST SP 800-22 ENTROPY & 2D BIT-NOISE VISUALIZER
@@ -452,7 +386,7 @@ with tab4:
 
     c_n1, c_n2 = st.columns([2, 1])
     with c_n1:
-        inspect_alg = st.selectbox("Select Algorithm for Visual Bit-Plane Inspection:", list(KEM_CLASSES.keys()))
+        inspect_alg = st.selectbox("Select Suite for Visual Bit-Plane Inspection:", list(SUITE_BY_NAME.keys()))
     with c_n2:
         num_secrets = st.slider("Consecutive Handshakes to Concatenate:", 128, 1024, 256, 64)
 
@@ -460,8 +394,8 @@ with tab4:
         nist_rows = []
         selected_bits = None
 
-        for name, cls in KEM_CLASSES.items():
-            inst = cls()
+        for name, (_, factory) in SUITE_BY_NAME.items():
+            inst = factory()
             chunks = [run_kem_exchange(inst, False)[2] for _ in range(num_secrets)]
             raw_bytes = b"".join(chunks)
             bits = np.unpackbits(np.frombuffer(raw_bytes, dtype=np.uint8))
@@ -470,26 +404,21 @@ with tab4:
             if name == inspect_alg:
                 selected_bits = bits
 
-            # 1. Monobit Test
             s_n = np.sum(2 * bits.astype(np.int64) - 1)
             p_mono = math.erfc((abs(s_n) / math.sqrt(n)) / math.sqrt(2.0))
 
-            # 2. Block Frequency (M=128)
             num_b = n // 128
             blocks = bits[:num_b * 128].reshape((num_b, 128))
             prop = np.sum(blocks, axis=1) / 128.0
             chi_sq = 4.0 * 128.0 * np.sum((prop - 0.5) ** 2)
-            # Normal approximation if scipy is absent
             p_block = math.erfc(abs(chi_sq - num_b) / math.sqrt(2.0 * num_b))
 
-            # 3. Runs Test
             pi = float(np.sum(bits)) / n
             v_obs = float(np.sum(bits[:-1] != bits[1:]) + 1)
             p_runs = math.erfc(
                 abs(v_obs - 2.0 * n * pi * (1.0 - pi)) / (2.0 * math.sqrt(2.0 * n) * pi * (1.0 - pi))
             )
 
-            # 4. Spectral DFT Test
             x_dft = 2 * bits.astype(np.float64) - 1.0
             m_dft = np.abs(np.fft.fft(x_dft)[: n // 2])
             t_thresh = math.sqrt(math.log(1.0 / 0.05) * n)
@@ -521,3 +450,174 @@ with tab4:
                 title=f"2D Bit-Plane Entropy Bitmap: {inspect_alg} ({side}x{side} bits)"
             )
             st.plotly_chart(fig_heat, use_container_width=True)
+
+
+# =========================================================================
+# TAB 5: LIVE CLIENT-SERVER & KEY STORE TELEMETRY
+# =========================================================================
+def load_keystore_records(role_dir: str):
+    files = sorted(glob.glob(os.path.join("key_store", role_dir, "*.json")), reverse=True)
+    records = []
+    for fpath in files:
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                data["_filepath"] = fpath
+                data["_filename"] = os.path.basename(fpath)
+                records.append(data)
+        except Exception:
+            continue
+    return records
+
+
+with tab5:
+    st.subheader("Live Async Client-Server Handshake Trigger & Key Store Explorer")
+
+    # 1. Server Status & Live Client Trigger
+    ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([1.2, 1.5, 1.3])
+    with ctrl_col1:
+        if srv_online:
+            st.success(f"**Server Status:** Listening on `{HOST}:{PORT}`")
+        else:
+            st.error(f"**Server Offline!** Run `./.venv/bin/python3 server.py` in a terminal.")
+
+    with ctrl_col2:
+        trigger_options = ["All 6 Suites (Full Sweep)"] + [
+            f"Suite [{sid}]: {sname}" for sid, (sname, _) in SUITE_REGISTRY.items()
+        ]
+        selected_trigger = st.selectbox("Select Client Handshake Target:", trigger_options)
+
+    with ctrl_col3:
+        st.write("")
+        st.write("")
+        run_client_btn = st.button(
+            "Launch Async Client Handshake",
+            type="primary",
+            disabled=not srv_online,
+            use_container_width=True
+        )
+
+    if run_client_btn:
+        suite_arg = "0"
+        if not selected_trigger.startswith("All"):
+            suite_arg = selected_trigger.split("[")[1].split("]")[0]
+
+        with st.spinner(f"Executing `client.py --suite {suite_arg}` over TCP `{HOST}:{PORT}`..."):
+            proc = subprocess.run(
+                [sys.executable, "client.py", "--suite", suite_arg],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+        if proc.returncode == 0:
+            st.success("Live Handshake & Parallel Telemetry Completed! Stored in `key_store/`.")
+            with st.expander("View Live `client.py` Terminal Output", expanded=False):
+                st.code(proc.stdout, language="text")
+        else:
+            st.error(f"Client execution failed:\n{proc.stderr}")
+
+    st.divider()
+
+    # 2. Load Stored JSON Records from key_store/client and key_store/server
+    client_records = load_keystore_records("client")
+    server_records = load_keystore_records("server")
+
+    # Build lookup of server shared secrets to verify client-server match
+    server_secrets = {r.get("shared_secret_hex"): r for r in server_records if "shared_secret_hex" in r}
+
+    if not client_records and not server_records:
+        st.info("No session JSON files found in `key_store/` yet. Click **Launch Async Client Handshake** above!")
+    else:
+        # Build Summary Table of Client Sessions with Parallel Telemetry
+        table_rows = []
+        for rec in client_records:
+            timings = rec.get("timings_ms", {})
+            precalc = rec.get("parallel_precalc", {})
+            telem = rec.get("parallel_telemetry", {})
+            nist = telem.get("nist_sp800_22", {})
+            mtu_eth = telem.get("mtu_fragmentation_matrix", {}).get("eth_1500", {})
+            ss_hex = rec.get("shared_secret_hex", "")
+            matched_srv = ss_hex in server_secrets
+
+            table_rows.append({
+                "Session ID": rec.get("session_id"),
+                "Suite": rec.get("suite"),
+                "PK (B)": rec.get("pk_bytes"),
+                "CT (B)": rec.get("ct_bytes"),
+                "Wire Total (B)": telem.get("wire_overhead_bytes", rec.get("pk_bytes", 0) + rec.get("ct_bytes", 0)),
+                "KeyGen (ms)": timings.get("keygen_ms", 0.0),
+                "Decap (ms)": timings.get("decap_ms", 0.0),
+                "Net Wait (ms)": timings.get("network_and_server_wait_ms", 0.0),
+                "Total RTT (ms)": timings.get("total_handshake_rtt_ms", rec.get("total_handshake_rtt_ms", 0.0)),
+                "Pkts @1500 MTU": f"{mtu_eth.get('client_segments', 1)}C + {mtu_eth.get('server_segments_ecdsa', 1)}S",
+                "Pkts @1280 MTU": f"{precalc.get('segments_at_1280_mtu', 1)}C",
+                "Monobit p": nist.get("monobit_p_value", 0.0),
+                "Runs p": nist.get("runs_p_value", 0.0),
+                "Shannon (bpb)": nist.get("payload_shannon_entropy_bpb", 0.0),
+                "Server Match": "MATCHED" if matched_srv else "UNPAIRED"
+            })
+
+        df_ks = pd.DataFrame(table_rows)
+
+        head_col1, head_col2 = st.columns([4, 1])
+        with head_col1:
+            st.markdown(f"#### Stored Key Exchange Telemetry (`{len(client_records)}` Client / `{len(server_records)}` Server Sessions)")
+        with head_col2:
+            if st.button("Clear Key Store Logs"):
+                for r in client_records + server_records:
+                    try:
+                        os.remove(r["_filepath"])
+                    except OSError:
+                        pass
+                st.rerun()
+
+        st.dataframe(df_ks, use_container_width=True)
+
+        # Visual Charts from Live Socket Telemetry
+        if len(df_ks) > 0:
+            v1, v2 = st.columns(2)
+            with v1:
+                fig_rtt = px.bar(
+                    df_ks.drop_duplicates(subset=["Suite"]),
+                    x="Suite",
+                    y=["KeyGen (ms)", "Decap (ms)", "Net Wait (ms)"],
+                    barmode="stack",
+                    title="Latest Live Socket Handshake Breakdown: Crypto CPU vs. Network Wait (ms)"
+                )
+                st.plotly_chart(fig_rtt, use_container_width=True)
+
+            with v2:
+                fig_ent = px.bar(
+                    df_ks.drop_duplicates(subset=["Suite"]),
+                    x="Suite",
+                    y="Shannon (bpb)",
+                    color="Suite",
+                    title="Measured Ciphertext Shannon Entropy (Bits per Byte, Ideal = 8.0)"
+                )
+                st.plotly_chart(fig_ent, use_container_width=True)
+
+        # 3. Deep JSON Key & Telemetry Inspector
+        st.markdown("#### Deep Key Store & Parallel Telemetry JSON Inspector")
+        insp_col1, insp_col2 = st.columns(2)
+
+        with insp_col1:
+            if client_records:
+                sel_cli_file = st.selectbox(
+                    "Inspect Client Key Store File:",
+                    [r["_filename"] for r in client_records]
+                )
+                cli_obj = next(r for r in client_records if r["_filename"] == sel_cli_file)
+                st.code(f"Shared Secret: {cli_obj.get('shared_secret_hex', '')}", language="text")
+                with st.expander("Full Client Session JSON", expanded=False):
+                    st.json({k: v for k, v in cli_obj.items() if not k.startswith("_")})
+
+        with insp_col2:
+            if server_records:
+                sel_srv_file = st.selectbox(
+                    "Inspect Server Key Store File:",
+                    [r["_filename"] for r in server_records]
+                )
+                srv_obj = next(r for r in server_records if r["_filename"] == sel_srv_file)
+                st.code(f"Shared Secret: {srv_obj.get('shared_secret_hex', '')}", language="text")
+                with st.expander("Full Server Session JSON", expanded=False):
+                    st.json({k: v for k, v in srv_obj.items() if not k.startswith("_")})
