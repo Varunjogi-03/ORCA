@@ -2,6 +2,7 @@ import oqs
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import serialization
 
 # Define the NIST FIPS 203 Standard Algorithm
 PQC_ALG = 'ML-KEM-768'
@@ -33,8 +34,8 @@ class HybridClient:
         """Generates classical and PQC keypairs and returns the public keys."""
         # 1. Generate Classical Public Key (32 bytes)
         x25519_pub_bytes = self.x25519_private_key.public_key().public_bytes(
-            encoding=x25519.serialization.Encoding.Raw,
-            format=x25519.serialization.PublicFormat.Raw
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
         )
         
         # 2. Generate PQC Public Key (1184 bytes)
@@ -68,8 +69,8 @@ class HybridServer:
         """Processes client keys, generates server keys, and derives the final AES key."""
         # 1. Generate Server Classical Public Key & Derive Secret
         server_x25519_pub_bytes = self.x25519_private_key.public_key().public_bytes(
-            encoding=x25519.serialization.Encoding.Raw,
-            format=x25519.serialization.PublicFormat.Raw
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
         )
         client_x25519_pub = x25519.X25519PublicKey.from_public_bytes(client_x25519_pub_bytes)
         classical_secret = self.x25519_private_key.exchange(client_x25519_pub)
